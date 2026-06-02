@@ -175,9 +175,19 @@ def fetch_edgar_facts(cik: str, *, refresh: bool = False) -> Optional[dict]:
 
 
 def _extract_concept(facts: dict, concept: str, gaap_options: list[str]) -> pd.DataFrame:
-    """Pull all 10-K / 10-Q rows for one friendly concept from raw EDGAR facts."""
+    """Pull all 10-K / 10-Q rows for one friendly concept from raw EDGAR facts.
+
+    Collects rows from ALL matching GAAP options and deduplicates by
+    (period_end, form), keeping the latest-filed row.  This is essential for
+    companies that changed which GAAP concept they tag on a given line item when
+    a new accounting standard was adopted (e.g. ASC 606 in 2018 caused many
+    companies to switch from SalesRevenueNet → RevenueFromContractWithCustomer).
+    Stopping at the first concept with any data would miss earlier years.
+    """
     us_gaap: dict = facts.get("facts", {}).get("us-gaap", {})
     preferred_units = _UNIT_PREF.get(concept, _DEFAULT_UNITS)
+
+    all_rows: list[dict] = []
 
     for gaap_name in gaap_options:
         entry = us_gaap.get(gaap_name)
@@ -186,16 +196,12 @@ def _extract_concept(facts: dict, concept: str, gaap_options: list[str]) -> pd.D
 
         for unit_label in preferred_units:
             records: list[dict] = entry.get("units", {}).get(unit_label, [])
-            if not records:
-                continue
-
-            rows = []
             for r in records:
                 if r.get("form", "") not in _ALL_FORMS:
                     continue
                 if not r.get("filed") or not r.get("end"):
                     continue
-                rows.append(
+                all_rows.append(
                     {
                         "concept": concept,
                         "gaap_name": gaap_name,
@@ -210,11 +216,22 @@ def _extract_concept(facts: dict, concept: str, gaap_options: list[str]) -> pd.D
                         "source": "edgar",
                     }
                 )
+            # Only try the first unit that yields results for this gaap_name
+            if any(r.get("form", "") in _ALL_FORMS for r in records if r.get("end")):
+                break  # found the right unit for this gaap_name; move to next gaap_name
 
-            if rows:
-                return pd.DataFrame(rows)
+    if not all_rows:
+        return pd.DataFrame(columns=list(SCHEMA.keys()))
 
-    return pd.DataFrame(columns=list(SCHEMA.keys()))
+    df = pd.DataFrame(all_rows)
+    # Deduplicate: for the same (period_end, form), keep the latest filing.
+    # This handles amended filings and cross-concept duplicates during transitions.
+    df = (
+        df.sort_values("filed")
+        .drop_duplicates(subset=["period_end", "form"], keep="last")
+        .reset_index(drop=True)
+    )
+    return df
 
 
 def _from_edgar(cik: str, *, refresh: bool = False) -> pd.DataFrame:
