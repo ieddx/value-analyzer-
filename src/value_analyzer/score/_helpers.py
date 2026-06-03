@@ -72,12 +72,33 @@ class Scorer:
         self._total = 0.0
         self.reasons: list[str] = []
         self.flags: list[str] = []
+        self._real_inputs = 0    # components backed by real data
+        self._total_inputs = 0   # all components attempted (real + floor)
 
-    def add(self, pts: float, max_pts: float, reason: str) -> None:
-        """Award *pts* (capped at *max_pts*) and record *reason*."""
+    def add(
+        self,
+        pts: float,
+        max_pts: float,
+        reason: str,
+        *,
+        data_available: bool = True,
+    ) -> None:
+        """Award *pts* (capped at *max_pts*) and record *reason*.
+
+        Parameters
+        ----------
+        data_available:
+            ``True`` (default) when the component is scored from real fetched
+            data.  Pass ``False`` when awarding a missing-data floor —
+            the score is unchanged but the component is counted as incomplete
+            for the data-completeness indicator in the report header.
+        """
         pts = float(max(0.0, min(pts, max_pts)))
         self._total += pts
         self.reasons.append(f"[+{pts:.1f}/{max_pts:.0f}] {reason}")
+        self._total_inputs += 1
+        if data_available:
+            self._real_inputs += 1
 
     def flag(self, msg: str) -> None:
         self.flags.append(f"⚠ {msg}")
@@ -88,6 +109,8 @@ class Scorer:
             score=round(min(100.0, max(0.0, self._total)), 1),
             reasons=self.reasons,
             flags=self.flags,
+            real_inputs=self._real_inputs,
+            total_inputs=self._total_inputs,
         )
 
 

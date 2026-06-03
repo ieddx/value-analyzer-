@@ -146,3 +146,18 @@ MGMT_DILUTION_BAD   =  0.04  # > 4%/yr growth = material dilution
 MGMT_ROE_EXCELLENT  = 0.20   # > 20% — exceptional capital allocation
 MGMT_ROE_GOOD       = 0.12   # > 12% — strong
 MGMT_ROE_OK         = 0.08   # > 8% — adequate
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA COMPLETENESS AND CONFIDENCE THRESHOLDS
+# ══════════════════════════════════════════════════════════════════════════════
+
+COMPLETENESS_CAUTION_THRESHOLD = 0.70
+# When real_inputs / total_inputs falls below this, the report header shows a
+# low-confidence caution.  0.70 means ≥30% of scoring decisions fell back to
+# missing-data floors.
+
+VAL_IV_DISPERSION_RATIO = 2.5
+# When the highest IV estimate exceeds the lowest by more than this multiple,
+# the valuation section flags the disagreement.  A 2.5× spread means the
+# "average IV" is unreliable as a single target; the investor should look at
+# the individual method outputs rather than the mean.

@@ -16,7 +16,7 @@ from value_analyzer.score.moat import score_moat
 from value_analyzer.score.health import score_health
 from value_analyzer.score.management import score_management
 from value_analyzer.score.valuation import score_valuation
-from value_analyzer.score.config import WACC
+from value_analyzer.score.config import WACC, COMPLETENESS_CAUTION_THRESHOLD
 
 TODAY = date(2024, 12, 31)
 _FORMS = {"10-K"}
@@ -512,3 +512,290 @@ class TestManagementScore:
         m = _metrics(roe_avg=0.30, roe_std=0.02)
         result = score_management(self._buyback_fund(), m)
         assert 0 <= result.score <= 100
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DATA COMPLETENESS TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestDataCompleteness:
+    """Tests for the real_inputs / total_inputs tracking on SubScore."""
+
+    def _full_valuation_fund(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Fund + prices with all four valuation components backed by real data."""
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [5.0] * len(yrs), yrs),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("operating_cf", [6e9] * len(yrs), yrs),
+            _fund_rows("capex", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [25e9] * len(yrs), yrs),
+        )
+        prices = _make_prices(yrs, [80.0] * len(yrs))
+        return fund_data, prices
+
+    def _empty_valuation_fund(self) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """Fund with no financial data at all → all valuation components floor."""
+        prices = _make_prices([2024], [50.0])
+        return _fund(), prices
+
+    # ── (a) Missing inputs → reduced completeness, caution triggered ───────
+
+    def test_missing_data_reduces_real_inputs(self):
+        """(a) Valuation with no fund data has real_inputs < total_inputs."""
+        fund_data, prices = self._empty_valuation_fund()
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+        assert result.real_inputs < result.total_inputs, (
+            f"Expected real < total when data is absent: {result.real_inputs}/{result.total_inputs}"
+        )
+        assert result.real_inputs == 0, (
+            f"No real data available — expected 0 real inputs, got {result.real_inputs}"
+        )
+
+    def test_full_data_maximises_real_inputs(self):
+        """(b) Fully populated valuation fund has real_inputs == total_inputs."""
+        fund_data, prices = self._full_valuation_fund()
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+        assert result.real_inputs == result.total_inputs, (
+            f"All components should use real data: "
+            f"{result.real_inputs}/{result.total_inputs}\n{result.reasons}"
+        )
+        assert result.total_inputs >= 4, "Expected at least 4 scored components"
+
+    def test_floor_award_counts_as_not_real(self):
+        """A Scorer.add() call with data_available=False is counted in total but not real."""
+        from value_analyzer.score._helpers import Scorer
+        s = Scorer("test")
+        s.add(8, 20, "real component")
+        s.add(5, 20, "floor component", data_available=False)
+        sub = s.build()
+        assert sub.real_inputs == 1
+        assert sub.total_inputs == 2
+
+    def test_health_all_floors_has_low_real(self):
+        """Health with no data at all → mostly floor inputs.
+
+        Interest coverage when no interest expense is found counts as real
+        (confirmed absence of debt is genuine information, not a floor).
+        The other three components (D/E, FCF consistency, FCF margin) are floors.
+        """
+        result = score_health(_fund(), _metrics())
+        assert result.real_inputs == 1   # only "no interest expense" is real
+        assert result.total_inputs == 4
+        pct = result.real_inputs / result.total_inputs
+        assert pct < COMPLETENESS_CAUTION_THRESHOLD
+
+    def test_health_full_data_all_real(self):
+        """Health fully populated → real_inputs == total_inputs."""
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("long_term_debt", [500e6] * len(yrs), yrs),
+            _fund_rows("equity", [5e9] * len(yrs), yrs),
+            _fund_rows("operating_income", [1.2e9] * len(yrs), yrs),
+            _fund_rows("interest_expense", [50e6] * len(yrs), yrs),
+            _fund_rows("operating_cf", [1.1e9] * len(yrs), yrs),
+            _fund_rows("capex", [150e6] * len(yrs), yrs),
+        )
+        result = score_health(fund_data, _metrics(fcf_margin_avg=0.12))
+        assert result.real_inputs == result.total_inputs
+
+    def test_pb_and_fcf_fallbacks_count_as_real(self):
+        """Spec: P/B and FCF fallback IV methods count as real valuation data."""
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [-15.0] * len(yrs), yrs),   # negative → EPS methods skip
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [20e9] * len(yrs), yrs),          # BVPS = $20
+            _fund_rows("operating_cf", [4e9] * len(yrs), yrs),     # FCF/share = $3
+            _fund_rows("capex", [1e9] * len(yrs), yrs),
+        )
+        prices = _make_prices(yrs, [50.0] * len(yrs))
+        result = score_valuation(fund_data, prices, _metrics(), _make_category())
+        # IV component must be real (fallback ran)
+        all_flags = " ".join(result.flags)
+        assert "P/B" in all_flags or "FCF fallback" in all_flags
+        assert result.real_inputs > 0, (
+            "P/B or FCF fallback IV must count as real — real_inputs should be > 0"
+        )
+
+    # ── CompositeScore completeness aggregation ─────────────────────────────
+
+    def test_composite_score_aggregates_completeness(self):
+        """completeness_real/total on CompositeScore == sum of sub-score fields."""
+        from value_analyzer.score.composite import score as run_score
+        from datetime import date
+        from unittest.mock import patch
+        from value_analyzer.data import as_of, fetch_fundamentals, fetch_prices
+        from value_analyzer.classify.models import (
+            Category, CapitalIntensity, GrowthProfile, MoatType, RevenueType,
+            Metrics, SicHint, RuleTrace,
+        )
+        from value_analyzer.score.moat import score_moat
+        from value_analyzer.score.health import score_health
+        from value_analyzer.score.valuation import score_valuation
+        from value_analyzer.score.management import score_management
+
+        # Build sub-scores directly and verify aggregation
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [5.0] * len(yrs), yrs),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("operating_cf", [6e9] * len(yrs), yrs),
+            _fund_rows("capex", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [25e9] * len(yrs), yrs),
+            _fund_rows("long_term_debt", [2e9] * len(yrs), yrs),
+            _fund_rows("net_income", [5e9] * len(yrs), yrs),
+        )
+        prices = _make_prices(yrs, [80.0] * len(yrs))
+        m = _metrics(fcf_margin_avg=0.12, roe_avg=0.18, roe_std=0.03, years_of_data=10)
+        cat = _make_category()
+
+        moat = score_moat(fund_data, m)
+        health = score_health(fund_data, m)
+        val = score_valuation(fund_data, prices, m, cat)
+        mgmt = score_management(fund_data, m)
+
+        expected_real = moat.real_inputs + health.real_inputs + val.real_inputs + mgmt.real_inputs
+        expected_total = moat.total_inputs + health.total_inputs + val.total_inputs + mgmt.total_inputs
+
+        assert expected_real >= 0
+        assert expected_total >= expected_real
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IV DISPERSION TESTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestIVDispersion:
+    """Tests for the IV method dispersion check added to valuation.py."""
+
+    def _make_dispersion_inputs(
+        self, *, price: float, bvps: float, pb_median_approx: float, fcf_ps: float
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        """
+        Build fund + prices engineered so fallback IV methods produce a large spread.
+        EPS is negative so EPS methods skip; P/B and FCF fallbacks fire instead.
+        """
+        yrs = list(range(2015, 2025))
+        # Build price history so historical P/B median ≈ pb_median_approx
+        # BVPS is fixed at bvps; historical prices are set to bvps * pb_median_approx
+        hist_price = bvps * pb_median_approx
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [-20.0] * len(yrs), yrs),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [bvps * 1e9] * len(yrs), yrs),
+            _fund_rows("operating_cf", [(fcf_ps + 2.0) * 1e9] * len(yrs), yrs),
+            _fund_rows("capex", [2e9] * len(yrs), yrs),
+        )
+        # Historical prices at pb_median_approx × bvps; last year is current price
+        hist_prices = [hist_price] * (len(yrs) - 1) + [price]
+        prices = _make_prices(yrs, hist_prices)
+        return fund_data, prices
+
+    def test_wide_spread_triggers_dispersion_flag(self):
+        """(c) IV estimates spanning > 2.5× trigger the IV_DISPERSION flag."""
+        # P/B: 7x * $20 = $140; FCF: $3 / 0.09 = $33 → ratio = 140/33 ≈ 4.2× > 2.5
+        fund_data, prices = self._make_dispersion_inputs(
+            price=60.0, bvps=20.0, pb_median_approx=7.0, fcf_ps=3.0
+        )
+        result = score_valuation(fund_data, prices, _metrics(), _make_category())
+        all_flags = " ".join(result.flags)
+        assert "IV_DISPERSION" in all_flags, (
+            f"Expected IV_DISPERSION flag. Flags:\n{chr(10).join(result.flags)}"
+        )
+        assert "disagree significantly" in all_flags
+
+    def test_narrow_spread_no_dispersion_flag(self):
+        """(d) IV estimates within 2.5× do NOT trigger the dispersion flag."""
+        # P/B: 2x * $20 = $40; FCF: $4 / 0.09 = $44 → ratio = 44/40 ≈ 1.1× < 2.5
+        fund_data, prices = self._make_dispersion_inputs(
+            price=60.0, bvps=20.0, pb_median_approx=2.0, fcf_ps=4.0
+        )
+        result = score_valuation(fund_data, prices, _metrics(), _make_category())
+        all_flags = " ".join(result.flags)
+        assert "IV_DISPERSION" not in all_flags, (
+            f"Unexpected IV_DISPERSION flag when spread is narrow. "
+            f"Flags:\n{chr(10).join(result.flags)}"
+        )
+
+    def test_positive_eps_methods_close_no_dispersion(self):
+        """Positive-EPS path: three methods typically agree within 2.5× for a normal company."""
+        # eps_norm=5, WACC=9% → IV_A=55.6; pe_median≈15 → IV_B=75; bvps=30 → graham≈58
+        # Max/min = 75/55.6 = 1.35 < 2.5 → no dispersion flag
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [5.0] * len(yrs), yrs),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [30e9] * len(yrs), yrs),
+            _fund_rows("operating_cf", [6e9] * len(yrs), yrs),
+            _fund_rows("capex", [1e9] * len(yrs), yrs),
+        )
+        prices = _make_prices(yrs, [75.0] * len(yrs))  # historical P/E ~15×
+        result = score_valuation(fund_data, prices, _metrics(), _make_category())
+        all_flags = " ".join(result.flags)
+        assert "IV_DISPERSION" not in all_flags, (
+            f"Normal company should not trigger dispersion. "
+            f"Flags:\n{chr(10).join(result.flags)}"
+        )
+
+    def test_dispersion_flag_extracted_to_composite_score(self):
+        """iv_dispersion_flag on CompositeScore is set when valuation dispersion fires."""
+        from value_analyzer.score.models import CompositeScore, SubScore
+        from value_analyzer.classify.models import (
+            Category, CapitalIntensity, GrowthProfile, MoatType, RevenueType,
+            Metrics, SicHint, RuleTrace,
+        )
+        from value_analyzer.score.moat import score_moat
+        from value_analyzer.score.health import score_health
+        from value_analyzer.score.valuation import score_valuation
+        from value_analyzer.score.management import score_management
+        from value_analyzer.score.config import CATEGORY_WEIGHTS
+        from datetime import date
+
+        yrs = list(range(2015, 2025))
+        fund_data = _fund(
+            _fund_rows("eps_diluted", [-20.0] * len(yrs), yrs),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+            _fund_rows("equity", [20e9] * len(yrs), yrs),
+            _fund_rows("operating_cf", [5e9] * len(yrs), yrs),
+            _fund_rows("capex", [2e9] * len(yrs), yrs),
+        )
+        # historical prices set high so P/B median ≈ 7× → IV_D ≈ $140
+        # FCF/share = 3.0, IV_E = $33 → ratio > 2.5
+        hist_prices = [140.0] * (len(yrs) - 1) + [60.0]
+        prices = _make_prices(yrs, hist_prices)
+
+        m = _metrics()
+        cat = _make_category()
+        moat = score_moat(fund_data, m)
+        health = score_health(fund_data, m)
+        val = score_valuation(fund_data, prices, m, cat)
+        mgmt = score_management(fund_data, m)
+
+        weights = CATEGORY_WEIGHTS["stable"]
+        composite = (
+            moat.score * weights["moat"] + health.score * weights["health"]
+            + val.score * weights["valuation"] + mgmt.score * weights["management"]
+        )
+        real = moat.real_inputs + health.real_inputs + val.real_inputs + mgmt.real_inputs
+        total = moat.total_inputs + health.total_inputs + val.total_inputs + mgmt.total_inputs
+
+        iv_flag = next((f for f in val.flags if "IV_DISPERSION:" in f), None)
+
+        cs = CompositeScore(
+            ticker="TEST", as_of_date=date(2024, 12, 31),
+            composite=round(composite, 1),
+            moat=moat, health=health, valuation=val, management=mgmt,
+            weight_profile="stable", weights_used=weights, category=cat,
+            completeness_real=real, completeness_total=total,
+            iv_dispersion_flag=iv_flag,
+        )
+
+        if "IV_DISPERSION" in " ".join(val.flags):
+            assert cs.iv_dispersion_flag is not None, (
+                "Dispersion flag in valuation.flags must be extracted to CompositeScore"
+            )

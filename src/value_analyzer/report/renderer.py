@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 _BACKTEST_SUMMARY_PATH = Path.home() / ".value_analyzer" / "backtest_summary.json"
 
 from value_analyzer.score.models import CompositeScore, SubScore
+from value_analyzer.score.config import COMPLETENESS_CAUTION_THRESHOLD
 from value_analyzer.peers.models import PeerComparison
 
 DISCLAIMER_TEXT = (
@@ -99,6 +100,43 @@ def _header_panel(cs: CompositeScore) -> Panel:
         f"valuation {weights['valuation']:.0%}  "
         f"management {weights['management']:.0%}"
     )
+
+    # ── Data completeness indicator ────────────────────────────────────────
+    real, total = cs.completeness_real, cs.completeness_total
+    if total > 0:
+        pct = real / total
+        comp_color = (
+            "green" if pct >= 0.85
+            else "yellow" if pct >= COMPLETENESS_CAUTION_THRESHOLD
+            else "red"
+        )
+        lines.append(
+            f"Data completeness: [{comp_color}]{real}/{total} inputs ({pct:.0%})[/{comp_color}]"
+        )
+
+        # Per-pillar detail for notably incomplete pillars (< 60%)
+        low_pillars = [
+            f"{sub.name} {sub.real_inputs}/{sub.total_inputs}"
+            for sub in (cs.moat, cs.health, cs.valuation, cs.management)
+            if sub.total_inputs > 0 and sub.real_inputs / sub.total_inputs < 0.60
+        ]
+        if low_pillars:
+            lines.append(f"  Incomplete pillars: {', '.join(low_pillars)}")
+
+        # Low-confidence caution when completeness is below threshold OR dispersion fires
+        caution_parts: list[str] = []
+        if pct < COMPLETENESS_CAUTION_THRESHOLD:
+            caution_parts.append(
+                f"data completeness {pct:.0%} < {COMPLETENESS_CAUTION_THRESHOLD:.0%} threshold"
+            )
+        if cs.iv_dispersion_flag is not None:
+            caution_parts.append("valuation methods disagree significantly")
+        if caution_parts:
+            lines.append(
+                f"[bold red]⚠ Low-confidence analysis: {'; '.join(caution_parts)} — "
+                "treat composite score and IV estimates as indicative only.[/bold red]"
+            )
+
     return Panel("\n".join(lines), title="[bold]Value Analyzer[/bold]", border_style="blue")
 
 

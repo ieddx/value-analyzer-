@@ -48,6 +48,7 @@ from .config import (
     VAL_PE_PREMIUM,
     WACC,
     TERMINAL_GROWTH,
+    VAL_IV_DISPERSION_RATIO,
 )
 from ._helpers import Scorer, annual_series, latest, price_at, safe_div
 from .models import SubScore
@@ -85,7 +86,8 @@ def score_valuation(
     # ── Current price and per-share figures ───────────────────────────────
     if prices.empty:
         s.flag("No price data available — valuation scoring skipped.")
-        s.add(25, 100, "No price data; awarding neutral floor across all components.")
+        s.add(25, 100, "No price data; awarding neutral floor across all components.",
+              data_available=False)
         return s.build()
 
     current_price = float(prices["close"].iloc[-1])
@@ -130,7 +132,7 @@ def score_valuation(
 
     if pe_current is None or pe_median is None:
         s.flag("P/E history unavailable — skipping P/E vs history component.")
-        s.add(8, 20, "P/E data unavailable; awarding neutral floor.")
+        s.add(8, 20, "P/E data unavailable; awarding neutral floor.", data_available=False)
     else:
         ratio = pe_current / pe_median
         s.flag(f"Current P/E = {pe_current:.1f}× | 10y median P/E = {pe_median:.1f}× | "
@@ -157,7 +159,7 @@ def score_valuation(
 
     if pfcf_current is None or pfcf_median is None:
         s.flag("P/FCF history unavailable — skipping P/FCF vs history component.")
-        s.add(8, 20, "P/FCF data unavailable; awarding neutral floor.")
+        s.add(8, 20, "P/FCF data unavailable; awarding neutral floor.", data_available=False)
     else:
         ratio = pfcf_current / pfcf_median
         s.flag(f"Current P/FCF = {pfcf_current:.1f}× | 10y median P/FCF = {pfcf_median:.1f}× | "
@@ -245,9 +247,22 @@ def score_valuation(
                 "such as goodwill impairment."
             )
 
+    # ── Dispersion check — flag when IV methods disagree strongly ────────────
+    if len(iv_estimates) >= 2:
+        iv_vals = [v for _, v in iv_estimates]
+        iv_hi, iv_lo = max(iv_vals), min(iv_vals)
+        if iv_lo > 0 and iv_hi / iv_lo > VAL_IV_DISPERSION_RATIO:
+            s.flag(
+                f"IV_DISPERSION: Valuation methods disagree significantly "
+                f"(${iv_lo:.2f}–${iv_hi:.2f}, {iv_hi / iv_lo:.1f}× spread) — "
+                "treat the average IV as low-confidence. "
+                "Review individual method outputs rather than relying on the mean."
+            )
+
     if not iv_estimates:
         # All methods exhausted — award floor score.
-        s.add(10, 35, "IV estimates unavailable; awarding conservative floor.")
+        s.add(10, 35, "IV estimates unavailable; awarding conservative floor.",
+              data_available=False)
     else:
         iv_avg = float(np.mean([v for _, v in iv_estimates]))
         mos = (iv_avg - current_price) / current_price
@@ -321,7 +336,7 @@ def score_valuation(
     else:
         fcf_reason = "FCF per share unavailable" if not fcf_ps else f"FCF per share = ${fcf_ps:.2f} (≤ 0)"
         s.flag(f"Reverse-DCF skipped: {fcf_reason}.")
-        s.add(8, 25, "Reverse-DCF unavailable; awarding conservative floor.")
+        s.add(8, 25, "Reverse-DCF unavailable; awarding conservative floor.", data_available=False)
 
     return s.build()
 

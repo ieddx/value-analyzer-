@@ -111,6 +111,22 @@ def score(ticker: str, *, as_of_date: date | None = None) -> CompositeScore:
     # ── 7. Peer comparison for report layer ───────────────────────────────
     peer_comparison = build_peer_comparison(fund, prices, profile, peer_stats)
 
+    # ── Aggregate completeness across all four sub-scores ─────────────────
+    completeness_real = (
+        moat.real_inputs + health.real_inputs
+        + valuation.real_inputs + management.real_inputs
+    )
+    completeness_total = (
+        moat.total_inputs + health.total_inputs
+        + valuation.total_inputs + management.total_inputs
+    )
+
+    # Extract IV-dispersion flag from valuation (prefix "IV_DISPERSION:" set by scorer)
+    iv_dispersion_flag = next(
+        (f for f in valuation.flags if "IV_DISPERSION:" in f),
+        None,
+    )
+
     return CompositeScore(
         ticker=ticker.upper(),
         as_of_date=as_of_date,
@@ -123,6 +139,9 @@ def score(ticker: str, *, as_of_date: date | None = None) -> CompositeScore:
         weights_used=weights,
         category=category,
         peer_comparison=peer_comparison,
+        completeness_real=completeness_real,
+        completeness_total=completeness_total,
+        iv_dispersion_flag=iv_dispersion_flag,
     )
 
 

@@ -127,7 +127,8 @@ def score_moat(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
     years = metrics.years_of_data
     if rev_cagr is None or years < 3:
         s.flag(f"Revenue CAGR unreliable (only {years} year(s) of data).")
-        s.add(3, 10, "Insufficient history for revenue trend scoring; awarding floor.")
+        s.add(3, 10, "Insufficient history for revenue trend scoring; awarding floor.",
+              data_available=False)
     elif rev_cagr > 0.08:
         s.add(10, 10, f"Revenue CAGR {rev_cagr:+.1%} over {years} years — "
                        "moat translates into meaningful growth.")

@@ -60,7 +60,7 @@ def score_management(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
 
     if shares_cagr is None or n_shares < 3:
         s.flag(f"Share count history too short ({n_shares} year(s)) to score dilution trend.")
-        s.add(10, 30, "Insufficient share-count history; awarding neutral floor.")
+        s.add(10, 30, "Insufficient share-count history; awarding neutral floor.", data_available=False)
     else:
         if shares_cagr < MGMT_BUYBACK_STRONG:
             s.add(30, 30, f"Share count CAGR = {shares_cagr:+.1%}/yr over {n_shares} years — "
@@ -88,7 +88,7 @@ def score_management(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
 
     if roe_avg is None:
         s.flag("ROE data unavailable (missing net income or equity).")
-        s.add(8, 25, "ROE unavailable; awarding conservative floor.")
+        s.add(8, 25, "ROE unavailable; awarding conservative floor.", data_available=False)
     else:
         roe_cv = (roe_std / abs(roe_avg)) if (roe_std and abs(roe_avg) > 0.005) else None
 
@@ -161,15 +161,17 @@ def score_management(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
                                "reinvestment returns inconclusive.")
         else:
             s.flag("Cannot compute return on retained earnings (missing net income or shares data).")
-            s.add(8, 25, "RORE unavailable; awarding conservative floor.")
+            s.add(8, 25, "RORE unavailable; awarding conservative floor.", data_available=False)
     else:
         s.flag(f"EPS history only {len(eps)} year(s) — 5 years required for RORE calculation.")
-        s.add(8, 25, "Insufficient EPS history for RORE; awarding conservative floor.")
+        s.add(8, 25, "Insufficient EPS history for RORE; awarding conservative floor.",
+              data_available=False)
 
     # ── 4. Dividend consistency (max 20) ─────────────────────────────────
     if divs.empty:
         s.add(8, 20, "No dividend data found — company either pays no dividends or "
-                      "data is unavailable. Neither confirms nor denies capital discipline.")
+                      "data is unavailable. Neither confirms nor denies capital discipline.",
+              data_available=False)
         s.flag("No dividend data available in EDGAR filings.")
     else:
         div_pos = divs[divs.abs() > 0]

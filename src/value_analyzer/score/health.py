@@ -53,7 +53,7 @@ def score_health(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
 
     if de is None:
         s.flag("Debt/Equity ratio unavailable (missing balance-sheet data).")
-        s.add(10, 25, "D/E ratio unavailable; awarding neutral floor.")
+        s.add(10, 25, "D/E ratio unavailable; awarding neutral floor.", data_available=False)
     elif de < HEALTH_DE_SAFE:
         s.add(25, 25, f"D/E = {de:.2f} < {HEALTH_DE_SAFE} — conservative balance sheet; "
                        "ample cushion to weather downturns.")
@@ -82,7 +82,7 @@ def score_health(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
                        "significant interest-bearing debt. Full credit for coverage.")
     elif coverage is None:
         s.flag("Interest coverage ratio unavailable.")
-        s.add(10, 25, "Interest coverage unavailable; awarding neutral floor.")
+        s.add(10, 25, "Interest coverage unavailable; awarding neutral floor.", data_available=False)
     elif coverage > HEALTH_COVERAGE_SAFE:
         s.add(25, 25, f"Interest coverage = {coverage:.1f}× > {HEALTH_COVERAGE_SAFE}× — "
                        "debt service is trivially comfortable.")
@@ -110,7 +110,7 @@ def score_health(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
 
     if common.empty:
         s.flag("Cannot compute FCF consistency — missing operating cash flow or capex data.")
-        s.add(8, 25, "FCF data unavailable; awarding conservative floor.")
+        s.add(8, 25, "FCF data unavailable; awarding conservative floor.", data_available=False)
     else:
         fcf_series = op_cf.loc[common] - capex.abs().loc[common]
         pct_pos = float((fcf_series > 0).mean())
@@ -140,7 +140,7 @@ def score_health(fund: pd.DataFrame, metrics: Metrics) -> SubScore:
     fcf_margin = metrics.fcf_margin_avg
     if fcf_margin is None:
         s.flag("FCF margin average unavailable.")
-        s.add(8, 25, "FCF margin unavailable; awarding conservative floor.")
+        s.add(8, 25, "FCF margin unavailable; awarding conservative floor.", data_available=False)
     elif fcf_margin > HEALTH_FCF_GOOD:
         s.add(25, 25, f"FCF margin avg {fcf_margin:.1%} > {HEALTH_FCF_GOOD:.0%} — "
                        "strong cash conversion; business generates substantial excess cash.")
