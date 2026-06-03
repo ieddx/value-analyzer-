@@ -1,4 +1,4 @@
-"""Tests for the live backtest-context line in render.py.
+"""Tests for the live backtest-context line in renderer.py.
 
 Four required cases:
   (a) "not yet run" message when the summary file is absent
@@ -7,33 +7,26 @@ Four required cases:
   (d) malformed JSON falls back gracefully
 
 All tests patch _BACKTEST_SUMMARY_PATH so they never touch the real filesystem.
+The module is now named renderer.py, so the package-level `render` function no
+longer shadows the submodule — a plain import and direct patch() both work.
 """
-
-from __future__ import annotations
 
 from __future__ import annotations
 
 import contextlib
 import io
 import json
-import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 from rich.console import Console
 
-# value_analyzer.report.render is shadowed at the package level by the re-exported
-# `render` function.  Access the real module through sys.modules after any import
-# that triggers its loading.
-import value_analyzer.report.render  # noqa: F401 — forces the module into sys.modules
-import value_analyzer.backtest.engine  # noqa: F401
+import value_analyzer.report.renderer as _render_mod
+import value_analyzer.backtest.engine as _engine_mod
 
-_render_mod = sys.modules["value_analyzer.report.render"]
-_engine_mod = sys.modules["value_analyzer.backtest.engine"]
-
-from value_analyzer.report.render import (
+from value_analyzer.report.renderer import (
     _backtest_context_line,
     _load_backtest_summary,
     DISCLAIMER_TEXT,

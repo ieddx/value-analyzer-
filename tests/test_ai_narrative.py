@@ -19,7 +19,7 @@ from rich.console import Console
 
 from value_analyzer.ai import generate_commentary
 from value_analyzer.report import DISCLAIMER_TEXT, render, render_markdown
-from value_analyzer.report.render import _ai_commentary_panel
+from value_analyzer.report.renderer import _ai_commentary_panel
 from value_analyzer.score.models import CompositeScore, SubScore
 from value_analyzer.classify.models import (
     Category, CapitalIntensity, GrowthProfile, MoatType, RevenueType,
