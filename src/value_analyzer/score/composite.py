@@ -18,6 +18,8 @@ from datetime import date
 from value_analyzer.classify import classify
 from value_analyzer.classify.models import GrowthProfile, RevenueType
 from value_analyzer.data import as_of, fetch_fundamentals, fetch_prices
+from value_analyzer.exceptions import TickerNotFoundError
+from value_analyzer.peers import build_peer_comparison, get_peer_stats
 
 from .config import CATEGORY_WEIGHTS
 from .health import score_health
@@ -69,29 +71,45 @@ def score(ticker: str, *, as_of_date: date | None = None) -> CompositeScore:
     raw_prices = fetch_prices(ticker)
     prices = as_of(raw_prices, as_of_date)
 
-    # ── 3. Sub-scores ─────────────────────────────────────────────────────
-    moat = score_moat(fund, metrics)
-    health = score_health(fund, metrics)
-    valuation = score_valuation(fund, prices, metrics, category)
-    management = score_management(fund, metrics)
+    # ── 3. Bail early if the ticker returned no usable data at all ────────
+    if fund.empty and prices.empty:
+        raise TickerNotFoundError(ticker)
 
-    # ── 4. Weight profile ─────────────────────────────────────────────────
+    # ── 4. Weight profile (needed before sub-scores so peer stats can use it)
     profile = _weight_profile(category)
     weights = CATEGORY_WEIGHTS.get(profile, CATEGORY_WEIGHTS["default"])
 
-    # ── 5. Composite ──────────────────────────────────────────────────────
+    # ── 5. Same-category peer stats (gracefully absent if registry not built)
+    peer_stats = get_peer_stats(profile, as_of_date)
+    if peer_stats is None:
+        logger.debug(
+            "%s: no peer registry for profile=%s — run build_peer_registry() to enable",
+            ticker, profile,
+        )
+
+    # ── 5. Sub-scores ─────────────────────────────────────────────────────
+    moat = score_moat(fund, metrics)
+    health = score_health(fund, metrics)
+    valuation = score_valuation(fund, prices, metrics, category, peer_stats=peer_stats)
+    management = score_management(fund, metrics)
+
+    # ── 6. Composite ──────────────────────────────────────────────────────
     composite = (
-        moat.score       * weights["moat"]
-        + health.score   * weights["health"]
-        + valuation.score * weights["valuation"]
+        moat.score         * weights["moat"]
+        + health.score     * weights["health"]
+        + valuation.score  * weights["valuation"]
         + management.score * weights["management"]
     )
 
     logger.info(
-        "%s composite=%.1f (moat=%.1f h=%.1f val=%.1f mgmt=%.1f profile=%s)",
+        "%s composite=%.1f (moat=%.1f h=%.1f val=%.1f mgmt=%.1f profile=%s peers=%s)",
         ticker, composite,
         moat.score, health.score, valuation.score, management.score, profile,
+        len(peer_stats.peer_tickers) if peer_stats else 0,
     )
+
+    # ── 7. Peer comparison for report layer ───────────────────────────────
+    peer_comparison = build_peer_comparison(fund, prices, profile, peer_stats)
 
     return CompositeScore(
         ticker=ticker.upper(),
@@ -104,6 +122,7 @@ def score(ticker: str, *, as_of_date: date | None = None) -> CompositeScore:
         weight_profile=profile,
         weights_used=weights,
         category=category,
+        peer_comparison=peer_comparison,
     )
 
 
