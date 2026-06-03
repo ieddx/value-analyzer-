@@ -16,7 +16,10 @@ Rules enforced here
 from __future__ import annotations
 
 import io
+import json
+import logging
 from datetime import date
+from pathlib import Path
 
 from rich.columns import Columns
 from rich.console import Console
@@ -24,6 +27,10 @@ from rich.panel import Panel
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
+
+logger = logging.getLogger(__name__)
+
+_BACKTEST_SUMMARY_PATH = Path.home() / ".value_analyzer" / "backtest_summary.json"
 
 from value_analyzer.score.models import CompositeScore, SubScore
 from value_analyzer.peers.models import PeerComparison
@@ -326,13 +333,86 @@ def _disclaimer_panel() -> Panel:
     )
 
 
+def _load_backtest_summary() -> dict | None:
+    """Read ~/.value_analyzer/backtest_summary.json.
+
+    Returns the parsed dict, or None if the file is absent or malformed.
+    No import of the backtest layer — uses stdlib json only.
+    """
+    try:
+        if not _BACKTEST_SUMMARY_PATH.exists():
+            return None
+        data = json.loads(_BACKTEST_SUMMARY_PATH.read_text())
+        if not isinstance(data, dict):
+            return None
+        return data
+    except (OSError, json.JSONDecodeError, ValueError) as exc:
+        logger.debug("could not read backtest summary: %s", exc)
+        return None
+
+
 def _backtest_context_line() -> str:
-    """Static note about backtest validity.  Updated if a live result is passed."""
+    """Render the backtest-context line from the stored summary file.
+
+    Reads ~/.value_analyzer/backtest_summary.json written by the backtest engine.
+    Falls back to "not yet run" when the file is absent or unreadable.
+    Never imports or triggers the backtest layer.
+    """
+    _CAVEAT = (
+        "A validated backtest is evidence, not a guarantee — "
+        "past edges decay and markets change."
+    )
+
+    summary = _load_backtest_summary()
+
+    if summary is None:
+        return (
+            "[dim]Backtest not yet run — score is unvalidated. "
+            "Run  value-analyzer --backtest  to generate out-of-sample context. "
+            f"{_CAVEAT}[/dim]"
+        )
+
+    # Pull fields, tolerating missing keys in old/partial files
+    run_date   = summary.get("run_date", "unknown date")
+    date_range = summary.get("date_range", "unknown range")
+    n_scored   = summary.get("n_scored")
+    edge       = summary.get("q1_vs_benchmark_1y")   # float or None
+    t_stat     = summary.get("t_stat_1y")             # float or None
+    p_value    = summary.get("p_value_1y")            # float or None
+    benchmark  = summary.get("benchmark_ticker", "index")
+
+    # Edge vs benchmark
+    if edge is not None:
+        edge_str = f"top-quintile edge vs {benchmark} {edge * 100:+.1f}% after costs"
+    else:
+        edge_str = "top-quintile edge vs index: n/a"
+
+    # Sample size
+    n_str = f"n={n_scored}" if n_scored is not None else "n=unknown"
+
+    # T-stat
+    if t_stat is not None:
+        t_str = f"t={t_stat:.2f}"
+        if p_value is not None:
+            t_str += f" (p={p_value:.2f})"
+    else:
+        t_str = "t=n/a"
+
+    # Robustness judgement — explicit "not robust" when t < 2 or data thin
+    robust = (
+        t_stat is not None and abs(t_stat) >= 2.0
+        and n_scored is not None and n_scored >= 30
+    )
+    if robust:
+        robust_note = "edge above t=2 threshold, but small-sample caution still applies"
+    else:
+        robust_note = "edge NOT statistically robust — small sample or low t-stat"
+
     return (
-        "[dim]Backtest context: out-of-sample validation (2013–2021 universe) shows "
-        "the composite score has modest correlation with 1-year forward returns in "
-        "some categories; no edge was found to be statistically robust across all "
-        "market regimes.  Treat the score as one analytical input, not a predictor.[/dim]"
+        f"[dim]Backtest (run {run_date}): {edge_str}, {t_str}, "
+        f"{n_str} over {date_range}. "
+        f"{robust_note.capitalize()}. "
+        f"{_CAVEAT}[/dim]"
     )
 
 

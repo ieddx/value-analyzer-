@@ -131,7 +131,7 @@ def _run_backtest() -> None:
 
 
 def _run_tune() -> None:
-    from value_analyzer.backtest.engine import run
+    from value_analyzer.backtest.engine import run, write_tuning_supplement
     from value_analyzer.backtest.config import DEFAULT_AS_OF_DATES
     from value_analyzer.backtest.universe import UNIVERSE
     from value_analyzer.backtest.tuning import tune_weights
@@ -146,6 +146,10 @@ def _run_tune() -> None:
 
     result = tune_weights(train_snaps, val_snaps, CATEGORY_WEIGHTS)
     print(result)
+
+    # Persist train/val correlation gap so the report can mention it
+    if result.train_spread_tuned is not None and result.val_spread_tuned is not None:
+        write_tuning_supplement(result.train_spread_tuned, result.val_spread_tuned)
 
 
 def main(argv: list[str] | None = None) -> None:
