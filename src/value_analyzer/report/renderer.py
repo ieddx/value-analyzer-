@@ -18,6 +18,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+import re
 from datetime import date
 from pathlib import Path
 
@@ -454,6 +455,243 @@ def _backtest_context_line() -> str:
     )
 
 
+# ── Evaluation & framework context ────────────────────────────────────────────
+
+def _evaluation_panel(cs: CompositeScore) -> Panel:
+    """Synthesis of the composite result: confidence assessment + framework context.
+
+    Part 1 — what the scores collectively say and how much to trust them.
+    Part 2 — educational framework context; never a directive for this specific stock.
+    """
+    # ── Extract supporting data ────────────────────────────────────────────────
+    real, total = cs.completeness_real, cs.completeness_total
+    comp_pct = real / total if total > 0 else 1.0
+
+    # Margin of safety from valuation flags
+    mos_val: float | None = None
+    mos_str = "not computed"
+    for f in cs.valuation.flags:
+        if "Margin of safety:" in f:
+            try:
+                raw = f.split("Margin of safety:")[1].strip().rstrip(".")
+                mos_str = raw
+                mos_val = float(raw.replace("%", "").replace("+", "")) / 100
+            except (ValueError, IndexError):
+                pass
+            break
+
+    # IV range from dispersion flag
+    iv_range_str: str | None = None
+    if cs.iv_dispersion_flag:
+        m = re.search(r'\$([0-9.]+)[–\-]\$([0-9.]+)', cs.iv_dispersion_flag)
+        if m:
+            iv_range_str = f"${m.group(1)}–${m.group(2)}"
+
+    # ── Confidence tier ────────────────────────────────────────────────────────
+    confidence_issues: list[str] = []
+
+    if total > 0 and comp_pct < COMPLETENESS_CAUTION_THRESHOLD:
+        confidence_issues.append(
+            f"data completeness {comp_pct:.0%} — {total - real} of {total} scoring "
+            "inputs fell back to missing-data floors"
+        )
+    elif total > 0 and comp_pct < 0.85:
+        confidence_issues.append(
+            f"data completeness {comp_pct:.0%} — some inputs estimated from floors"
+        )
+
+    if cs.iv_dispersion_flag:
+        spread_note = f" (range {iv_range_str})" if iv_range_str else ""
+        confidence_issues.append(
+            f"valuation methods disagree significantly{spread_note} — "
+            "the average IV is unreliable as a single target; review individual method outputs"
+        )
+
+    if comp_pct < COMPLETENESS_CAUTION_THRESHOLD:
+        tier, tier_color = "LOW", "red"
+    elif not confidence_issues:
+        tier, tier_color = "HIGH", "green"
+    else:
+        tier, tier_color = "MEDIUM", "yellow"
+
+    # ── Quality and valuation reads ────────────────────────────────────────────
+    quality_avg = (cs.moat.score + cs.health.score) / 2
+    if quality_avg >= 70:
+        quality_read = "high-quality business with strong fundamentals"
+    elif quality_avg >= 50:
+        quality_read = "above-average business quality with some limitations"
+    elif quality_avg >= 35:
+        quality_read = "mixed business-quality signals"
+    else:
+        quality_read = "below-average business-quality indicators"
+
+    if mos_val is not None:
+        if mos_val >= 0.25:
+            val_read = f"meaningful margin of safety ({mos_str} below framework IV)"
+        elif mos_val >= 0.10:
+            val_read = f"moderate margin of safety ({mos_str} below framework IV)"
+        elif mos_val >= 0:
+            val_read = f"thin margin of safety ({mos_str} below framework IV)"
+        else:
+            val_read = f"priced above framework IV ({mos_str})"
+    else:
+        if cs.valuation.score >= 65:
+            val_read = "appears attractively valued relative to framework IV estimates"
+        elif cs.valuation.score >= 45:
+            val_read = "roughly fairly valued relative to framework IV estimates"
+        else:
+            val_read = "appears fully valued or above framework IV estimates"
+
+    # Strongest / weakest pillar
+    subs = [
+        (cs.moat, "moat"), (cs.health, "health"),
+        (cs.valuation, "valuation"), (cs.management, "management"),
+    ]
+    subs_sorted = sorted(subs, key=lambda x: x[0].score)
+    weakest_name, weakest_score = subs_sorted[0][1], subs_sorted[0][0].score
+    strongest_name, strongest_score = subs_sorted[-1][1], subs_sorted[-1][0].score
+
+    profile_note = {
+        "compounder": "weighted toward moat quality and management",
+        "stable":     "balanced weighting across all dimensions",
+        "cyclical":   "weighted toward valuation and financial health",
+        "declining":  "weighted toward financial survival and price",
+    }.get(cs.weight_profile, "equally weighted across dimensions")
+
+    # ── Build panel text ───────────────────────────────────────────────────────
+    lines: list[str] = []
+
+    # ── Part 1 ────────────────────────────────────────────────────────────────
+    lines.append(
+        "[bold]Part 1 — Evaluation of this analysis[/bold]"
+    )
+    lines.append("")
+
+    lines.append(
+        f"The composite of [bold]{cs.composite:.1f}/100[/bold] ({profile_note}) "
+        f"reflects a {quality_read}. Valuation: {val_read}. "
+        f"Strongest pillar: {strongest_name} ({strongest_score:.0f}/100); "
+        f"weakest: {weakest_name} ({weakest_score:.0f}/100)."
+    )
+    lines.append("")
+
+    lines.append(
+        f"[bold]Confidence in this assessment: [{tier_color}]{tier}[/{tier_color}][/bold]"
+    )
+    if not confidence_issues:
+        lines.append(
+            f"  All {total} scoring inputs resolved from real filed data and valuation "
+            "methods are in reasonable agreement. The score reflects actual business "
+            "metrics rather than estimated floors."
+        )
+    else:
+        for issue in confidence_issues:
+            lines.append(f"  [{tier_color}]·[/{tier_color}] {issue[:1].upper()}{issue[1:]}.")
+        lines.append(
+            "  Treat the composite score and IV estimates as indicative. "
+            "A wider margin of safety than usual is appropriate when confidence is not HIGH."
+        )
+    lines.append("")
+
+    # Backtest calibration note — reads stored summary for dynamic data, falls
+    # back to static language when no backtest has been run.
+    summary = _load_backtest_summary()
+    if summary:
+        run_date = summary.get("run_date", "prior run")
+        n_scored = summary.get("n_scored", "n/a")
+        t1 = summary.get("t_stat_1y")
+        t1_str = f"t={t1:.2f}" if t1 is not None else "t=n/a"
+        lines.append(
+            f"[dim]Backtest calibration (run {run_date}, {n_scored} scored pairs): "
+            "this framework showed a Q1–Q5 spread near zero at 1-year horizons "
+            f"({t1_str}, not statistically significant at α=0.10) but roughly +41% "
+            "Q1-over-Q5 at 5-year horizons (hit rate 88%, t≈2.1, p≈0.07 on 8 df — "
+            "borderline, small sample). "
+            "The composite is a long-horizon analytical signal; it has no demonstrated "
+            "predictive value at horizons under ~3 years on this dataset.[/dim]"
+        )
+    else:
+        lines.append(
+            "[dim]Backtest calibration: no validated backtest on file. "
+            "When a backtest is available, this framework has shown signal mainly at "
+            "5-year horizons and none at 1-year, on a small 43-ticker sample — "
+            "borderline statistical significance. The composite is a long-horizon "
+            "analytical signal, not a short-term or proven indicator.[/dim]"
+        )
+    lines.append("")
+
+    # ── Part 2 ────────────────────────────────────────────────────────────────
+    lines.append(
+        "[bold]Part 2 — Framework context (educational; not an instruction for this stock)[/bold]"
+    )
+    lines.append("")
+
+    lines.append(
+        "[bold]Margin of safety:[/bold] "
+        "The Graham tradition holds that paying materially less than intrinsic value "
+        "provides a buffer against estimation error and adverse developments. "
+        "An investor applying this framework would look for a gap of at least 25% below "
+        "IV for a stable, high-quality business — and a wider gap (40%+) for an uncertain "
+        "or cyclical one. "
+        f"When confidence is [{tier_color}]{tier}[/{tier_color}], the required cushion "
+        "grows: a wider spread between price and IV is needed to compensate for "
+        "the added uncertainty in the estimate itself."
+    )
+    lines.append("")
+
+    lines.append(
+        "[bold]Conviction and position sizing:[/bold] "
+        "Value investors approach sizing differently by school of thought. "
+        "A concentrated approach (Buffett/Munger) treats highest-conviction ideas as "
+        "potentially deserving larger weights (5–10% of a portfolio); exploratory or "
+        "lower-conviction ideas receive smaller weights (1–3%). "
+        "A mechanical equal-weight approach (Greenblatt) avoids overconfidence in any "
+        "single estimate by spreading positions equally across a basket. "
+        "An investor applying conviction-scaling would typically require higher composite "
+        "scores and/or wider margins of safety before committing larger allocations — "
+        "and would downgrade conviction when confidence is not HIGH."
+    )
+    lines.append("")
+
+    lines.append(
+        "[bold]Partial-Kelly as an overbetting guard:[/bold] "
+        "The Kelly criterion derives a theoretically optimal bet fraction from estimated "
+        "edge and win probability. Because any IV estimate carries model uncertainty, "
+        "practitioners typically apply a fraction of full Kelly (¼ to ½) as insurance "
+        "against being confidently wrong. "
+        "An investor using partial-Kelly would treat the confidence tier as an input to "
+        "their own edge estimate — lower confidence implies lower effective Kelly fraction."
+    )
+    lines.append("")
+
+    lines.append(
+        "[bold]Time horizon and diversification:[/bold] "
+        "This framework's demonstrated properties are at 5-year horizons. "
+        "An investor whose time horizon is shorter than that would be using the tool "
+        "outside the window where it has shown any historical signal. "
+        "Even at appropriate horizons, holding 10–20 diversified positions limits the "
+        "damage from any single analytical or data error — and caps the cost of the "
+        "inevitable cases where even a well-reasoned analysis proves incorrect."
+    )
+    lines.append("")
+
+    lines.append(
+        "[dim]These framework outputs are illustrative — not instructions for this stock. "
+        "The composite score and IV estimates reflect stated analytical frameworks applied "
+        "to public data under specific assumptions (WACC, growth rate, P/E multiples). "
+        "They describe what the frameworks say about the business, not what the price "
+        "will do. Risk tolerance, tax situation, existing portfolio, liquidity needs, and "
+        "personal financial circumstances differ for every investor. "
+        "The analytical decision and its financial consequences are the investor's own.[/dim]"
+    )
+
+    return Panel(
+        "\n".join(lines),
+        title="[bold]Evaluation & Framework Context[/bold]",
+        border_style="cyan",
+    )
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def render(
@@ -502,6 +740,9 @@ def render(
     con.print()
 
     con.print(_backtest_context_line())
+    con.print()
+
+    con.print(_evaluation_panel(cs))
     con.print()
 
     ai_panel = _ai_commentary_panel(ai_commentary, ai_attempted)
