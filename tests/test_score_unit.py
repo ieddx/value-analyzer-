@@ -274,6 +274,191 @@ class TestValuationScore:
         for r in result.reasons:
             assert r.startswith("[+"), f"Reason missing prefix: {r!r}"
 
+    # ── Negative-EPS fallback tests (Fixes 1–3) ───────────────────────────
+
+    def _make_negative_eps_inputs(
+        self,
+        *,
+        price: float,
+        eps_values: list[float],
+        shares: float,
+        equity_per_share: float,
+        fcf_ps: float | None,
+    ):
+        """Build fund + prices for a company with negative EPS."""
+        yrs = list(range(2015, 2025))
+        n = len(yrs)
+        # Pad eps_values if shorter than yrs
+        if len(eps_values) < n:
+            eps_values = ([-5.0] * (n - len(eps_values))) + eps_values
+
+        rows = [
+            _fund_rows("eps_diluted", eps_values, yrs),
+            _fund_rows("shares_outstanding", [shares] * n, yrs),
+            _fund_rows("equity", [equity_per_share * shares] * n, yrs),
+        ]
+        if fcf_ps is not None:
+            # Positive FCF: fcf = op_cf - capex; give op_cf = (fcf_ps + small capex) * shares
+            capex_ps = 2.0
+            rows += [
+                _fund_rows("operating_cf", [(fcf_ps + capex_ps) * shares] * n, yrs),
+                _fund_rows("capex", [capex_ps * shares] * n, yrs),
+            ]
+        fund_data = _fund(*rows)
+        prices = _make_prices(yrs, [price] * n)
+        return fund_data, prices
+
+    def test_negative_eps_positive_bvps_gets_pb_estimate(self):
+        """(a) Negative EPS + positive BVPS → P/B estimate appears in flags."""
+        fund_data, prices = self._make_negative_eps_inputs(
+            price=40.0,
+            eps_values=[-20.0, -25.0, -2.0],   # deeply negative 3y avg
+            shares=1e9,
+            equity_per_share=25.0,              # BVPS = $25
+            fcf_ps=None,                        # no FCF so only P/B fires
+        )
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+
+        all_flags = " ".join(result.flags)
+        assert "P/B" in all_flags or "P/b" in all_flags.lower(), (
+            f"Expected P/B estimate in flags. Flags were:\n{chr(10).join(result.flags)}"
+        )
+        # Must not say "missing EPS or book-value data" (the old wrong message)
+        assert "missing EPS" not in all_flags
+        assert "missing EPS or book-value" not in all_flags
+        # IV scoring path must have run (score > floor of 10)
+        assert result.score > 10, f"P/B fallback should produce IV estimate above floor, got {result.score}"
+
+    def test_negative_eps_positive_fcf_gets_fcf_estimate(self):
+        """(b) Negative EPS + positive FCF/share → FCF earnings-power estimate appears."""
+        fund_data, prices = self._make_negative_eps_inputs(
+            price=40.0,
+            eps_values=[-20.0, -25.0, -2.0],
+            shares=1e9,
+            equity_per_share=-1.0,   # negative equity → P/B fallback won't fire
+            fcf_ps=3.50,             # positive FCF/share
+        )
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+
+        all_flags = " ".join(result.flags)
+        assert "FCF" in all_flags, (
+            f"Expected FCF estimate in flags. Flags were:\n{chr(10).join(result.flags)}"
+        )
+        assert "earnings power" in all_flags.lower() or "FCF fallback" in all_flags, (
+            f"Expected FCF earnings-power label in flags."
+        )
+        assert "missing EPS" not in all_flags
+        assert result.score > 10, f"FCF fallback should produce IV estimate above floor, got {result.score}"
+
+    def test_error_message_absent_eps_vs_negative_eps(self):
+        """(c) Error message correctly distinguishes absent EPS from negative EPS."""
+        yrs = list(range(2015, 2025))
+        prices = _make_prices(yrs, [50.0] * len(yrs))
+        m = _metrics()
+        cat = _make_category()
+
+        # Case 1: no EPS data at all (eps_norm is None)
+        fund_no_eps = _fund(
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+        )
+        result_absent = score_valuation(fund_no_eps, prices, m, cat)
+        flags_absent = " ".join(result_absent.flags)
+        assert "EPS data absent" in flags_absent, (
+            f"Expected 'EPS data absent' flag when EPS is missing. Got:\n{chr(10).join(result_absent.flags)}"
+        )
+        assert "negative" not in flags_absent.lower() or "EPS data absent" in flags_absent
+
+        # Case 2: EPS present but negative
+        fund_neg_eps = _fund(
+            _fund_rows("eps_diluted", [-15.0, -20.0, -5.0], list(range(2022, 2025))),
+            _fund_rows("shares_outstanding", [1e9] * len(yrs), yrs),
+        )
+        result_negative = score_valuation(fund_neg_eps, prices, m, cat)
+        flags_negative = " ".join(result_negative.flags)
+        assert "negative" in flags_negative.lower(), (
+            f"Expected 'negative' in flags when EPS is negative. Got:\n{chr(10).join(result_negative.flags)}"
+        )
+        assert "non-cash impairment" in flags_negative.lower() or "impairment" in flags_negative.lower(), (
+            f"Expected impairment context in negative-EPS flag."
+        )
+        # Must NOT say the old misleading message
+        assert "missing EPS or book-value data" not in flags_negative
+
+    def test_fallback_labels_appear_in_iv_estimate_flags(self):
+        """Fallback IV estimates carry distinct labels so the investor knows which method ran."""
+        fund_data, prices = self._make_negative_eps_inputs(
+            price=40.0,
+            eps_values=[-20.0, -25.0, -2.0],
+            shares=1e9,
+            equity_per_share=20.0,
+            fcf_ps=3.0,
+        )
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+
+        all_flags = " ".join(result.flags)
+        # At least one fallback method label must appear in the IV estimate flags
+        assert ("P/B reversion" in all_flags or "FCF earnings power" in all_flags
+                or "No-growth FCF" in all_flags), (
+            f"Fallback IV label missing from flags:\n{chr(10).join(result.flags)}"
+        )
+
+    def test_positive_eps_still_uses_eps_methods(self):
+        """Regression: positive-EPS path unchanged — fallbacks must NOT fire."""
+        fund_data, prices = self._make_inputs(price=50.0, eps=5.0, fcf_ps=4.0, shares=1e9)
+        m = _metrics()
+        cat = _make_category()
+        result = score_valuation(fund_data, prices, m, cat)
+
+        all_flags = " ".join(result.flags)
+        # EPS-based methods should appear
+        assert "EPS_norm" in all_flags or "earnings power" in all_flags.lower()
+        # Fallback flags must not appear when EPS is positive
+        assert "P/B fallback" not in all_flags
+        assert "FCF fallback" not in all_flags
+        assert "normalised EPS is negative" not in all_flags
+
+
+# ── _build_pb_history unit tests ───────────────────────────────────────────────
+
+class TestBuildPbHistory:
+    """Unit tests for the P/B history builder added in Fix 2."""
+
+    def test_returns_dict_with_pb_values(self):
+        from value_analyzer.score.valuation import _build_pb_history
+        yrs = [2019, 2020, 2021, 2022, 2023]
+        shares = 1e9
+        equity_s = pd.Series([20 * shares] * len(yrs), index=yrs)
+        shares_s = pd.Series([shares] * len(yrs), index=yrs)
+        prices = _make_prices(yrs, [30.0] * len(yrs))  # price=30, BVPS=20 → P/B=1.5
+        result = _build_pb_history(equity_s, shares_s, prices)
+        assert len(result) == len(yrs)
+        for pb in result.values():
+            assert abs(pb - 1.5) < 0.01, f"Expected P/B ≈ 1.5, got {pb}"
+
+    def test_skips_years_with_negative_equity(self):
+        from value_analyzer.score.valuation import _build_pb_history
+        yrs = [2020, 2021, 2022]
+        shares = 1e9
+        equity_s = pd.Series([-5 * shares, 20 * shares, 20 * shares], index=yrs)
+        shares_s = pd.Series([shares] * 3, index=yrs)
+        prices = _make_prices(yrs, [30.0] * 3)
+        result = _build_pb_history(equity_s, shares_s, prices)
+        assert 2020 not in result  # negative equity skipped
+        assert 2021 in result
+        assert 2022 in result
+
+    def test_returns_empty_for_empty_inputs(self):
+        from value_analyzer.score.valuation import _build_pb_history
+        empty = pd.Series(dtype=float)
+        prices = pd.DataFrame({"close": []})
+        assert _build_pb_history(empty, empty, prices) == {}
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MANAGEMENT TESTS

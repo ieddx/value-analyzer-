@@ -34,6 +34,7 @@ import numpy as np
 import pandas as pd
 
 from value_analyzer.classify.models import Metrics, MoatType, Category
+from value_analyzer.peers.models import CategoryPeerStats
 
 from .config import (
     PEER_PE,
@@ -57,6 +58,7 @@ def score_valuation(
     prices: pd.DataFrame,
     metrics: Metrics,
     category: Category,
+    peer_stats: CategoryPeerStats | None = None,
 ) -> SubScore:
     """Compute the valuation sub-score.
 
@@ -69,7 +71,11 @@ def score_valuation(
     metrics:
         Pre-computed Metrics from the classify layer.
     category:
-        Used to select the appropriate peer P/E reference.
+        Used to select the peer P/E fallback when no peer registry is available.
+    peer_stats:
+        Same-category peer aggregate stats from the peer registry.  When
+        provided, the peer context flag uses actual same-category peers rather
+        than the static PEER_PE averages.
     """
     s = Scorer("valuation")
 
@@ -174,6 +180,7 @@ def score_valuation(
     # ── 3. Margin of safety — intrinsic value estimate (max 35) ──────────
     iv_estimates: list[tuple[str, float]] = []
 
+    # Methods A–C require positive normalised EPS.
     # Method A: No-growth earnings power = normalised EPS / WACC
     if eps_norm and eps_norm > 0:
         iv_a = eps_norm / WACC
@@ -189,8 +196,57 @@ def score_valuation(
         iv_c = math.sqrt(22.5 * eps_norm * bvps)
         iv_estimates.append((f"Graham Number (√(22.5 × {eps_norm:.2f} × {bvps:.2f}))", iv_c))
 
+    # ── FIX 1: when EPS methods produced nothing, explain why and try fallbacks ──
     if not iv_estimates:
-        s.flag("Cannot compute intrinsic-value estimates (missing EPS or book-value data).")
+        # Correct error message: distinguish absent data from negative earnings.
+        if eps_norm is None:
+            s.flag("IV estimates unavailable — EPS data absent.")
+        else:
+            s.flag(
+                f"IV estimates unavailable via earnings methods — normalised EPS is "
+                f"negative ({eps_norm:.2f}), likely non-cash impairment; "
+                "earnings-based frameworks require positive earnings."
+            )
+
+        # ── FIX 2: P/B-reversion fallback (used when BVPS is available) ──────────
+        # Computes median historical P/B ratio and applies it to current book value.
+        # Only invoked when EPS-based methods produced no estimates.
+        if bvps and bvps > 0:
+            pb_history = _build_pb_history(equity_series, shares_series, prices)
+            pb_median = float(np.nanmedian(list(pb_history.values()))) if pb_history else None
+            if pb_median and pb_median > 0:
+                iv_d = pb_median * bvps
+                iv_estimates.append((
+                    f"P/B reversion ({pb_median:.2f}× median P/B × BVPS ${bvps:.2f}; "
+                    f"{len(pb_history)}-yr P/B history)",
+                    iv_d,
+                ))
+                s.flag(
+                    f"P/B fallback: median historical P/B = {pb_median:.2f}× "
+                    f"(over {len(pb_history)} years) × BVPS ${bvps:.2f} = ${iv_d:.2f}. "
+                    "Book-value multiples are sensitive to leverage, asset mix, and "
+                    "intangible write-downs — treat as a rough floor, not a precise target."
+                )
+
+        # ── FIX 3: No-growth FCF earnings-power fallback ─────────────────────────
+        # IV = FCF_per_share / WACC.  Conservative floor: zero perpetual FCF growth.
+        # Only invoked when EPS-based methods produced no estimates.
+        if fcf_ps and fcf_ps > 0:
+            iv_e = fcf_ps / WACC
+            iv_estimates.append((
+                f"No-growth FCF earnings power "
+                f"(FCF_ps ${fcf_ps:.2f} / WACC {WACC:.0%})",
+                iv_e,
+            ))
+            s.flag(
+                f"FCF fallback: FCF/share ${fcf_ps:.2f} ÷ WACC {WACC:.0%} = ${iv_e:.2f}. "
+                "Conservative floor — assumes zero perpetual FCF growth. "
+                "Appropriate when accounting earnings are distorted by non-cash charges "
+                "such as goodwill impairment."
+            )
+
+    if not iv_estimates:
+        # All methods exhausted — award floor score.
         s.add(10, 35, "IV estimates unavailable; awarding conservative floor.")
     else:
         iv_avg = float(np.mean([v for _, v in iv_estimates]))
@@ -256,15 +312,11 @@ def score_valuation(
                 s.flag(f"Reverse-DCF implies {g_implied:.1%}/yr FCF growth in perpetuity — "
                        "verify this is achievable given business fundamentals.")
 
-        # Peer P/E context (acknowledged as approximate)
-        moat_key = category.moat_type.value
-        peer_pe = PEER_PE.get(moat_key, PEER_PE.get("none", 15.0))
-        if category.revenue_type.value == "cyclical_commodity":
-            peer_pe = PEER_PE["cyclical"]
-        if pe_current:
-            s.flag(f"Peer context (approx. long-run typical P/E for '{moat_key}' moat businesses: "
-                   f"{peer_pe:.0f}×; current P/E = {pe_current:.1f}×). "
-                   "Peer P/Es are rough historical averages, not current market levels.")
+        # Peer P/E context — same-category peers when available, static fallback otherwise
+        if peer_stats is not None and pe_current is not None:
+            _flag_same_category_peers(s, peer_stats, pe_current)
+        elif pe_current is not None:
+            _flag_static_peer_pe(s, category, pe_current)
 
     else:
         fcf_reason = "FCF per share unavailable" if not fcf_ps else f"FCF per share = ${fcf_ps:.2f} (≤ 0)"
@@ -275,6 +327,45 @@ def score_valuation(
 
 
 # ── Private helpers ────────────────────────────────────────────────────────
+
+def _flag_same_category_peers(
+    s: "Scorer",
+    peer_stats: CategoryPeerStats,
+    pe_current: float,
+) -> None:
+    n = len(peer_stats.peer_tickers)
+    profile = peer_stats.weight_profile
+    if peer_stats.pe_median is not None:
+        range_str = (
+            f" (P25 {peer_stats.pe_p25:.1f}× – P75 {peer_stats.pe_p75:.1f}×)"
+            if peer_stats.pe_p25 is not None and peer_stats.pe_p75 is not None
+            else ""
+        )
+        s.flag(
+            f"Same-category peer context ({n} {profile} stocks from value investor "
+            f"portfolios): P/E median {peer_stats.pe_median:.1f}×{range_str}; "
+            f"current P/E {pe_current:.1f}×. "
+            "Reference only — not a valuation target."
+        )
+    else:
+        s.flag(
+            f"Same-category peer registry present ({n} {profile} stocks) "
+            "but P/E data unavailable for peers."
+        )
+
+
+def _flag_static_peer_pe(s: "Scorer", category, pe_current: float) -> None:
+    moat_key = category.moat_type.value
+    peer_pe = PEER_PE.get(moat_key, PEER_PE.get("none", 15.0))
+    if category.revenue_type.value == "cyclical_commodity":
+        peer_pe = PEER_PE["cyclical"]
+    s.flag(
+        f"Peer context (approx. long-run typical P/E for '{moat_key}' moat businesses: "
+        f"{peer_pe:.0f}×; current P/E = {pe_current:.1f}×). "
+        "No same-category peer registry — using static reference. "
+        "Run build_peer_registry() to enable same-category peers."
+    )
+
 
 def _build_pe_history(
     eps_series: pd.Series, prices: pd.DataFrame
@@ -289,6 +380,31 @@ def _build_pe_history(
         ye_price = price_at(prices, pd.Timestamp(f"{year}-12-31"))
         if ye_price:
             result[int(year)] = ye_price / eps
+    return result
+
+
+def _build_pb_history(
+    equity_series: pd.Series,
+    shares_series: pd.Series,
+    prices: pd.DataFrame,
+) -> dict[int, float]:
+    """Return {year: P/B} for years where equity, shares, and a year-end price are available.
+
+    Used as a fallback IV input when normalised EPS is negative.
+    """
+    result: dict[int, float] = {}
+    if equity_series.empty or shares_series.empty or prices.empty:
+        return result
+    common = equity_series.index.intersection(shares_series.index)
+    for year in common:
+        eq = float(equity_series.loc[year])
+        sh = float(shares_series.loc[year])
+        if sh <= 0 or eq <= 0:
+            continue
+        bvps_yr = eq / sh
+        ye_price = price_at(prices, pd.Timestamp(f"{year}-12-31"))
+        if ye_price and bvps_yr > 0:
+            result[int(year)] = ye_price / bvps_yr
     return result
 
 
