@@ -10,3 +10,7 @@ htmlcov/
 *.DS_Store
 .env
 *.log
+
+# API keys
+*.env
+.env.*
