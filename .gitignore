@@ -8,11 +8,15 @@ build/
 .coverage
 htmlcov/
 *.DS_Store
-.env
 *.log
 
-# API keys (Finnhub, Anthropic, etc.)
-# Set FINNHUB_API_KEY in environment; never commit key files.
+# API keys — set in environment, never commit key files
+# Covers ANTHROPIC_API_KEY, FINNHUB_API_KEY, and any other secrets in .env files
+.env
 *.env
 .env.*
 .env.finnhub
+
+# One-off experiment / backtest scripts (not part of the package)
+run_backtest.py
+backtest_output.txt
