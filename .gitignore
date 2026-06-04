@@ -11,6 +11,8 @@ htmlcov/
 .env
 *.log
 
-# API keys
+# API keys (Finnhub, Anthropic, etc.)
+# Set FINNHUB_API_KEY in environment; never commit key files.
 *.env
 .env.*
+.env.finnhub

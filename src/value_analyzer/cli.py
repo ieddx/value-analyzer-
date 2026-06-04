@@ -72,7 +72,7 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def _run_analysis(ticker: str, as_of_str: str, markdown: bool, no_ai: bool) -> None:
+def _run_analysis(ticker: str, as_of_str: str, markdown: bool, no_ai: bool, no_news: bool = False) -> None:
     from datetime import date as _date
     from value_analyzer.exceptions import DataUnavailableError, TickerNotFoundError
     from value_analyzer.score import score
@@ -98,15 +98,20 @@ def _run_analysis(ticker: str, as_of_str: str, markdown: bool, no_ai: bool) -> N
         print(f"Unexpected error fetching data for {ticker!r}: {exc}", file=sys.stderr)
         sys.exit(4)
 
+    news = None
+    if not no_news:
+        from value_analyzer.news import fetch_news
+        news = fetch_news(ticker, as_of_date=as_of)
+
     ai_commentary: str | None = None
     ai_attempted = not no_ai
     if ai_attempted:
-        ai_commentary = generate_commentary(result)
+        ai_commentary = generate_commentary(result, news=news)
 
     if markdown:
-        print(render_markdown(result, ai_commentary=ai_commentary, ai_attempted=ai_attempted))
+        print(render_markdown(result, ai_commentary=ai_commentary, ai_attempted=ai_attempted, news=news))
     else:
-        render(result, ai_commentary=ai_commentary, ai_attempted=ai_attempted)
+        render(result, ai_commentary=ai_commentary, ai_attempted=ai_attempted, news=news)
 
 
 def _maybe_network_error(exc: Exception) -> None:
@@ -180,7 +185,7 @@ def main(argv: list[str] | None = None) -> None:
         parser.print_help()
         sys.exit(0)
 
-    _run_analysis(args.ticker, args.as_of, args.markdown, args.no_ai)
+    _run_analysis(args.ticker, args.as_of, args.markdown, args.no_ai, args.no_news)
 
 
 if __name__ == "__main__":

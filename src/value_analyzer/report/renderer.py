@@ -21,6 +21,10 @@ import logging
 import re
 from datetime import date
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from value_analyzer.news.models import NewsResult as _NewsResult
 
 from rich.columns import Columns
 from rich.console import Console
@@ -692,6 +696,38 @@ def _evaluation_panel(cs: CompositeScore) -> Panel:
     )
 
 
+# ── News section ──────────────────────────────────────────────────────────────
+
+def _news_panel(news: "_NewsResult") -> Panel:
+    """Render a panel showing recent news headlines."""
+    lines: list[str] = []
+    lines.append(
+        "[dim italic]External context — does not affect the composite score "
+        "or any valuation math.[/dim italic]"
+    )
+    lines.append(
+        "Material events (capital raises, M&A, guidance changes, leadership changes) "
+        "may post-date the latest SEC filing this analysis is based on. "
+        "Weigh news against the filed fundamentals above using your own judgment."
+    )
+    lines.append("")
+
+    for item in news.items[:8]:
+        lines.append(
+            f"[dim]{item.published_at}[/dim]  [bold]{item.source}[/bold]  {item.headline}"
+        )
+
+    lines.append("")
+    lines.append(f"[dim]Provider: {news.provider}  |  Fetched: {news.fetched_at}[/dim]")
+
+    return Panel("\n".join(lines), title="[bold]Recent News[/bold]", border_style="dim")
+
+
+def _news_unavailable_line(news: "_NewsResult") -> str:
+    """Return a dim line when news.error is set."""
+    return f"[dim]Recent news: unavailable ({news.error})[/dim]"
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def render(
@@ -700,6 +736,7 @@ def render(
     console: Console | None = None,
     ai_commentary: str | None = None,
     ai_attempted: bool = False,
+    news: "_NewsResult | None" = None,
 ) -> None:
     """Render *cs* to the terminal (or the supplied *console*)."""
     con = console or Console()
@@ -745,6 +782,14 @@ def render(
     con.print(_evaluation_panel(cs))
     con.print()
 
+    if news is not None:
+        if news.available:
+            con.print(_news_panel(news))
+            con.print()
+        else:
+            con.print(_news_unavailable_line(news))
+            con.print()
+
     ai_panel = _ai_commentary_panel(ai_commentary, ai_attempted)
     if ai_panel is not None:
         con.print(ai_panel)
@@ -761,6 +806,7 @@ def render_markdown(
     *,
     ai_commentary: str | None = None,
     ai_attempted: bool = False,
+    news: "_NewsResult | None" = None,
 ) -> str:
     """Return a plain-text markdown representation of *cs*.
 
@@ -768,5 +814,5 @@ def render_markdown(
     """
     buf = io.StringIO()
     con = Console(file=buf, highlight=False, markup=False, width=300)
-    render(cs, console=con, ai_commentary=ai_commentary, ai_attempted=ai_attempted)
+    render(cs, console=con, ai_commentary=ai_commentary, ai_attempted=ai_attempted, news=news)
     return buf.getvalue()

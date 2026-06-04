@@ -26,8 +26,12 @@ from __future__ import annotations
 import logging
 import os
 from datetime import date
+from typing import TYPE_CHECKING
 
 from value_analyzer.score.models import CompositeScore
+
+if TYPE_CHECKING:
+    from value_analyzer.news.models import NewsResult
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +65,26 @@ analysis that has already been computed for you.  You MUST follow these rules:
 
 # ── Prompt builder ─────────────────────────────────────────────────────────────
 
-def _build_user_message(cs: CompositeScore) -> str:
+def _news_section(news: "NewsResult") -> str:
+    """Return the markdown news headlines block to append to the user message."""
+    lines: list[str] = [
+        f"### Recent news headlines (last 30 days, via {news.provider})",
+    ]
+    for item in news.items:
+        lines.append(f"{item.published_at}  {item.source}: {item.headline}")
+    lines += [
+        "",
+        "**Task for news section**: Identify any apparent MATERIAL events among the "
+        "headlines above (equity offering or dilution, M&A activity, major guidance change, "
+        "significant litigation, leadership change) that could affect the investment thesis "
+        "but would not yet appear in the filed fundamentals analyzed above. If no material "
+        "event is apparent, say so briefly. Interpret only what the headlines state — "
+        "do NOT invent or speculate beyond them. Do NOT issue buy, sell, or hold directives.",
+    ]
+    return "\n".join(lines)
+
+
+def _build_user_message(cs: CompositeScore, news: "NewsResult | None" = None) -> str:
     cat = cs.category
     lines: list[str] = [
         f"## Analysis summary for {cs.ticker} — as of {cs.as_of_date}",
@@ -123,12 +146,16 @@ def _build_user_message(cs: CompositeScore) -> str:
         "Follow the rules in the system prompt: no directive language, analysis not advice.",
     ]
 
+    if news is not None and news.available:
+        lines.append("")
+        lines.append(_news_section(news))
+
     return "\n".join(lines)
 
 
 # ── Public API ─────────────────────────────────────────────────────────────────
 
-def generate_commentary(cs: CompositeScore) -> str | None:
+def generate_commentary(cs: CompositeScore, news: "NewsResult | None" = None) -> str | None:
     """Return a qualitative interpretation of *cs*, or ``None`` on any failure.
 
     Requires ``ANTHROPIC_API_KEY`` in the environment.  If the key is absent or
@@ -166,7 +193,7 @@ def generate_commentary(cs: CompositeScore) -> str | None:
             }],
             messages=[{
                 "role": "user",
-                "content": _build_user_message(cs),
+                "content": _build_user_message(cs, news=news),
             }],
         ) as stream:
             message = stream.get_final_message()
